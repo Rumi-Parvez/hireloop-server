@@ -3,11 +3,13 @@ import dotenv from "dotenv";
 import express from "express";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe";    
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ==========================================
 // MIDDLEWARE
@@ -44,9 +46,15 @@ async function connectDB() {
   collections.savedJobs = db.collection("savedJobs");
   collections.applications = db.collection("applications");
   collections.notifications = db.collection("notifications");
+  collections.premium = db.collection("premium");
+  collections.authUsers = db.collection("user");
+
+
 
   console.log("MongoDB connected");
 }
+
+
 
 // ==========================================
 // HELPER FUNCTIONS
@@ -923,6 +931,236 @@ app.get(
     });
   })
 );
+
+// ==========================================
+// PREMIUM PAYMENT
+// ==========================================
+
+
+app.post("/user/premium", async (req, res) => {
+  try {
+    // 1. Get Stripe session ID
+    const { sessionId } = req.body;
+
+    if (!sessionId) {
+      return res.status(400).json({
+        success: false,
+        message: "Session ID is required",
+      });
+    }
+
+    // 2. Retrieve session directly from Stripe
+    const session = await stripe.checkout.sessions.retrieve(
+      sessionId,
+      {
+        expand: ["payment_intent"],
+      }
+    );
+
+    // 3. Verify payment status
+    if (
+      session.status !== "complete" ||
+      session.payment_status !== "paid"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment not completed",
+      });
+    }
+
+    // 4. Get user information from Stripe metadata
+    const metadata = session.metadata;
+
+    if (!metadata?.userId) {
+      return res.status(400).json({
+        success: false,
+        message: "User metadata not found",
+      });
+    }
+
+    // 5. Get payment information
+    const paymentIntent =
+      typeof session.payment_intent === "object"
+        ? session.payment_intent
+        : null;
+
+    const premiumUser = {
+      id: metadata.userId,
+      name: metadata.userName || "",
+      email:
+        session.customer_details?.email ||
+        metadata.userEmail ||
+        "",
+
+      planName: metadata.planName || "Premium",
+
+      planMode: metadata.planMode || "one-time",
+
+      payment: {
+        status: session.payment_status,
+        checkoutStatus: session.status,
+
+        sessionId: session.id,
+
+        paymentIntentId: paymentIntent?.id || null,
+
+        amount: session.amount_total,
+
+        currency: session.currency,
+
+        customerEmail:
+          session.customer_details?.email ||
+          metadata.userEmail ||
+          "",
+
+        paidAt: new Date(session.created * 1000),
+      },
+
+      createdAt: new Date(),
+    };
+
+    // 6. Save in MongoDB (avoid duplicate sessions)
+    const result = await collections.premium.updateOne(
+      { sessionId: session.id },
+      {
+        $setOnInsert: {
+          ...premiumUser,
+          sessionId: session.id,
+        },
+      },
+      { upsert: true }
+    );
+
+    // 7. Send response
+    return res.status(200).json({
+      success: true,
+      message: result.upsertedCount
+        ? "Premium user saved successfully"
+        : "Premium user already exists",
+
+      data: premiumUser,
+    });
+
+  } catch (error) {
+    console.error("Premium POST Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save premium user",
+    });
+  }
+});
+
+
+
+
+
+
+
+app.patch("/user/premium", async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+
+    // 1. Validate session ID
+    if (!sessionId) {
+      return res.status(400).json({
+        success: false,
+        message: "Session ID is required",
+      });
+    }
+
+    // 2. Retrieve Checkout Session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(
+      sessionId
+    );
+
+    // 3. Verify payment
+    if (
+      session.status !== "complete" ||
+      session.payment_status !== "paid"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment is not completed",
+      });
+    }
+
+    // 4. Get Better Auth user ID from Stripe metadata
+    const userId = session.metadata?.userId;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID not found in Stripe metadata",
+      });
+    }
+
+    // 5. Find Better Auth user
+    // Support string id and MongoDB ObjectId formats
+    const userConditions = [
+      { id: userId },
+      { _id: userId },
+    ];
+
+    if (ObjectId.isValid(userId)) {
+      userConditions.push({
+        _id: new ObjectId(userId),
+      });
+    }
+
+    const result = await collections.authUsers.updateOne(
+      {
+        $or: userConditions,
+      },
+      {
+        $set: {
+          hasPaid: true,
+          isPremium: true,
+          plan: "premium",
+          paymentStatus: "paid",
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    // 6. Check if user exists
+    if (result.matchedCount === 0) {
+      console.error("Better Auth user not found:", userId);
+
+      return res.status(404).json({
+        success: false,
+        message: "Better Auth user not found",
+      });
+    }
+
+    // 7. Success response
+    return res.status(200).json({
+      success: true,
+      message: "Premium account activated successfully",
+      data: {
+        userId,
+        hasPaid: true,
+        isPremium: true,
+        plan: "premium",
+        paymentStatus: "paid",
+      },
+    });
+
+  } catch (error) {
+    console.error("Premium PATCH Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update Premium status",
+    });
+  }
+});
+
+
+
+
+
+
 
 // ==========================================
 // ERROR HANDLER
